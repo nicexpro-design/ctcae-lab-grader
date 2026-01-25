@@ -1,0 +1,405 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>CTCAE v5.0 Lab Grader (MVP)</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; max-width: 980px; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    label { display:block; font-size: 14px; margin: 10px 0 6px; }
+    input, select { width: 100%; padding: 10px; font-size: 14px; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 16px; margin-top: 16px; }
+    .out { font-size: 18px; font-weight: 700; }
+    .muted { color:#555; font-size: 13px; line-height: 1.45; }
+    .pill { display:inline-block; padding: 2px 10px; border: 1px solid #ccc; border-radius: 999px; font-size: 12px; margin-left: 8px; }
+    .err { color: #b00020; font-size: 13px; }
+    .hint { font-size: 12px; color: #666; margin-top: 6px; }
+    .footer { margin-top: 18px; font-size: 12px; color:#666; }
+  </style>
+</head>
+<body>
+  <h2>CTCAE v5.0 – Lab değerinden Grade hesaplama (MVP)</h2>
+
+  <div class="card">
+    <div class="row">
+      <div>
+        <label>Terim</label>
+        <select id="term"></select>
+        <div class="hint" id="termHint"></div>
+      </div>
+      <div>
+        <label>Değer</label>
+        <input id="value" type="number" step="any" placeholder="örn: 3.2" />
+      </div>
+    </div>
+
+    <div class="row">
+      <div>
+        <label>Ünite</label>
+        <select id="unit"></select>
+      </div>
+      <div id="ulnWrap">
+        <label>ULN (üst limit)</label>
+        <input id="uln" type="number" step="any" placeholder="örn: 40 (U/L)" />
+      </div>
+    </div>
+
+    <div class="row">
+      <div id="llnWrap">
+        <label>LLN (alt limit)</label>
+        <input id="lln" type="number" step="any" placeholder="örn: 13.5 (g/dL) / 1.5 (x10^9/L) / 135 (mmol/L)" />
+      </div>
+      <div id="baselineWrap">
+        <label>Baseline (varsa)</label>
+        <input id="baseline" type="number" step="any" placeholder="örn: 55 (U/L) / 1.0 (mg/dL)" />
+      </div>
+    </div>
+
+    <div class="row">
+      <div id="symptWrap">
+        <label>Semptom var mı?</label>
+        <select id="sympt">
+          <option value="no">Hayır (asemptomatik)</option>
+          <option value="yes">Evet (semptomatik)</option>
+        </select>
+      </div>
+      <div id="intervWrap">
+        <label>Girişim / yatış / hayatı tehdit?</label>
+        <select id="sevFlags">
+          <option value="none">Yok</option>
+          <option value="intervention">Müdahale başlandı (intervention initiated)</option>
+          <option value="hospital">Yatış gerekli (hospitalization indicated)</option>
+          <option value="life">Hayatı tehdit (life-threatening consequences)</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="err" id="err"></div>
+
+    <div class="card" style="background:#fafafa;">
+      <div class="out" id="out">Grade: —</div>
+      <div class="muted" id="criterion"></div>
+    </div>
+
+    <div class="footer">
+      Bu araç operasyonel destek içindir. Nihai AE derecelendirmesi protokol, klinik bağlam ve medikal değerlendirme ile doğrulanmalıdır.
+    </div>
+  </div>
+
+<script>
+/** --------- yardımcı dönüşümler ---------- **/
+function num(x){ const v = parseFloat(x); return Number.isFinite(v) ? v : NaN; }
+function toPerMm3(value, unit){
+  // 1 x10^9/L = 1000 /mm3
+  if(unit === "per_mm3") return value;
+  if(unit === "x10e9_L") return value * 1000;
+  return NaN;
+}
+function toGdL(value, unit){
+  // CTCAE tablosundaki eşdeğerlere uyumlu pratik dönüşüm:
+  // 100 g/L = 10 g/dL ; 6.2 mmol/L ≈ 10 g/dL  => 1 mmol/L ≈ 1.6129 g/dL
+  if(unit === "g_dL") return value;
+  if(unit === "g_L") return value / 10;
+  if(unit === "mmol_L") return value * (10/6.2);
+  return NaN;
+}
+
+/** --------- kural motoru (MVP) ---------- **/
+const TERMS = [
+  {
+    id: "alt",
+    name: "ALT increased",
+    units: [{id:"U_L", label:"U/L"}],
+    needs: { uln:true, baseline:true, lln:false, sympt:false, flags:false },
+    hint: "Baseline normal/anormal ayrımı var; baseline girmen faydalı.",
+    grade: (v, ctx) => {
+      const ratioULN = v/ctx.uln;
+      const hasBaseline = Number.isFinite(ctx.baseline) && ctx.baseline>0;
+      const baselineAbn = hasBaseline && ctx.baseline > ctx.uln;
+      const ratioBase = baselineAbn ? v/ctx.baseline : NaN;
+      const r = baselineAbn ? ratioBase : ratioULN;
+
+      if(!Number.isFinite(r)) return {g:null, c:"Hesap için ULN ve (baseline anormalse) baseline gerekli."};
+
+      if(r <= 1) return {g:0, c:"≤ ULN (Grade yok)"};
+      if(r > 20) return {g:4, c: baselineAbn ? ">20× baseline" : ">20× ULN"};
+      if(r > 5)  return {g:3, c: baselineAbn ? ">5–20× baseline" : ">5–20× ULN"};
+      if(r > 3)  return {g:2, c: baselineAbn ? ">3–5× baseline" : ">3–5× ULN"};
+      return {g:1, c: baselineAbn ? "1.5–3× baseline" : ">ULN–3× ULN"};
+    }
+  },
+  {
+    id: "ast",
+    name: "AST increased",
+    units: [{id:"U_L", label:"U/L"}],
+    needs: { uln:true, baseline:true, lln:false, sympt:false, flags:false },
+    hint: "ALT ile aynı aralık mantığı (baseline normal/anormal).",
+    grade: (v, ctx) => {
+      const ratioULN = v/ctx.uln;
+      const hasBaseline = Number.isFinite(ctx.baseline) && ctx.baseline>0;
+      const baselineAbn = hasBaseline && ctx.baseline > ctx.uln;
+      const ratioBase = baselineAbn ? v/ctx.baseline : NaN;
+      const r = baselineAbn ? ratioBase : ratioULN;
+
+      if(!Number.isFinite(r)) return {g:null, c:"Hesap için ULN ve (baseline anormalse) baseline gerekli."};
+
+      if(r <= 1) return {g:0, c:"≤ ULN (Grade yok)"};
+      if(r > 20) return {g:4, c: baselineAbn ? ">20× baseline" : ">20× ULN"};
+      if(r > 5)  return {g:3, c: baselineAbn ? ">5–20× baseline" : ">5–20× ULN"};
+      if(r > 3)  return {g:2, c: baselineAbn ? ">3–5× baseline" : ">3–5× ULN"};
+      return {g:1, c: baselineAbn ? "1.5–3× baseline" : ">ULN–3× ULN"};
+    }
+  },
+  {
+    id: "bili",
+    name: "Blood bilirubin increased (total)",
+    units: [{id:"mg_dL", label:"mg/dL"}, {id:"umol_L", label:"µmol/L (dönüşüm yok—mg/dL gir)"}],
+    needs: { uln:true, baseline:true, lln:false, sympt:false, flags:false },
+    hint: "CTCAE v5 bilirubin için baseline normal/anormal ayrımı var.",
+    grade: (v, ctx) => {
+      const ratioULN = v/ctx.uln;
+      const hasBaseline = Number.isFinite(ctx.baseline) && ctx.baseline>0;
+      const baselineAbn = hasBaseline && ctx.baseline > ctx.uln;
+      const r = baselineAbn ? (v/ctx.baseline) : ratioULN;
+
+      if(!Number.isFinite(r)) return {g:null, c:"Hesap için ULN ve (baseline anormalse) baseline gerekli."};
+
+      if(r <= 1) return {g:0, c:"≤ ULN (Grade yok)"};
+      if(r > 10) return {g:4, c: baselineAbn ? ">10× baseline" : ">10× ULN"};
+      if(r > 3)  return {g:3, c: baselineAbn ? ">3–10× baseline" : ">3–10× ULN"};
+      if(r > 1.5)return {g:2, c: baselineAbn ? ">1.5–3× baseline" : ">1.5–3× ULN"};
+      return {g:1, c: baselineAbn ? ">1.0–1.5× baseline" : ">ULN–1.5× ULN"};
+    }
+  },
+  {
+    id: "creat",
+    name: "Creatinine increased",
+    units: [{id:"mg_dL", label:"mg/dL"}, {id:"umol_L", label:"µmol/L (dönüşüm yok—mg/dL gir)"}],
+    needs: { uln:true, baseline:true, lln:false, sympt:false, flags:false },
+    hint: "v5.0’da Grade 2-3 için ‘x baseline’ alternatifi var; baseline girmen gerekir.",
+    grade: (v, ctx) => {
+      const rULN = v/ctx.uln;
+      const hasBaseline = Number.isFinite(ctx.baseline) && ctx.baseline>0;
+      const rBase = hasBaseline ? (v/ctx.baseline) : NaN;
+
+      if(!Number.isFinite(rULN)) return {g:null, c:"Hesap için ULN gerekli."};
+
+      if(rULN <= 1) return {g:0, c:"≤ ULN (Grade yok)"};
+      if(rULN > 6) return {g:4, c:">6× ULN"};
+      if(rULN > 3 || (Number.isFinite(rBase) && rBase > 3)) return {g:3, c: (Number.isFinite(rBase)&&rBase>3) ? ">3× baseline veya >3–6× ULN" : ">3–6× ULN"};
+      if(rULN > 1.5 || (Number.isFinite(rBase) && rBase > 1.5)) return {g:2, c: (Number.isFinite(rBase)&&rBase>1.5) ? ">1.5–3× baseline veya >1.5–3× ULN" : ">1.5–3× ULN"};
+      return {g:1, c:">ULN–1.5× ULN"};
+    }
+  },
+
+  // Hematoloji
+  {
+    id: "anemia",
+    name: "Anemia (Hemoglobin)",
+    units: [{id:"g_dL", label:"g/dL"}, {id:"g_L", label:"g/L"}, {id:"mmol_L", label:"mmol/L"}],
+    needs: { uln:false, baseline:false, lln:true, sympt:false, flags:false },
+    hint: "Grade aralıkları Hgb üzerinden (LLN gerekir).",
+    grade: (vRaw, ctx, unit) => {
+      const v = toGdL(vRaw, unit);
+      const lln = toGdL(ctx.lln, unit); // aynı ünite varsayıyoruz
+      if(!Number.isFinite(v) || !Number.isFinite(lln)) return {g:null, c:"Hesap için değer ve LLN gerekli."};
+
+      if(v >= lln) return {g:0, c:"≥ LLN (Grade yok)"};
+      if(v < 8.0)  return {g:3, c:"<8.0 g/dL (CTCAE’de ‘transfusion indicated’ notu var)"};
+      if(v < 10.0) return {g:2, c:"<10.0–8.0 g/dL"};
+      return {g:1, c:"<LLN–10.0 g/dL"};
+    }
+  },
+  {
+    id: "anc",
+    name: "Neutrophil count decreased (ANC)",
+    units: [{id:"per_mm3", label:"/mm³"}, {id:"x10e9_L", label:"x10^9/L"}],
+    needs: { uln:false, baseline:false, lln:true, sympt:false, flags:false },
+    hint: "LLN gerekir. Aralıklar mutlak sayım üzerinden.",
+    grade: (vRaw, ctx, unit) => {
+      const v = toPerMm3(vRaw, unit);
+      const lln = toPerMm3(ctx.lln, unit);
+      if(!Number.isFinite(v) || !Number.isFinite(lln)) return {g:null, c:"Hesap için değer ve LLN gerekli."};
+
+      if(v >= lln) return {g:0, c:"≥ LLN (Grade yok)"};
+      if(v < 500)  return {g:4, c:"<500/mm³"};
+      if(v < 1000) return {g:3, c:"<1000–500/mm³"};
+      if(v < 1500) return {g:2, c:"<1500–1000/mm³"};
+      return {g:1, c:"<LLN–1500/mm³"};
+    }
+  },
+  {
+    id: "plt",
+    name: "Platelet count decreased",
+    units: [{id:"per_mm3", label:"/mm³"}, {id:"x10e9_L", label:"x10^9/L"}],
+    needs: { uln:false, baseline:false, lln:true, sympt:false, flags:false },
+    hint: "LLN gerekir. Aralıklar mutlak trombosit sayımı üzerinden.",
+    grade: (vRaw, ctx, unit) => {
+      const v = toPerMm3(vRaw, unit);
+      const lln = toPerMm3(ctx.lln, unit);
+      if(!Number.isFinite(v) || !Number.isFinite(lln)) return {g:null, c:"Hesap için değer ve LLN gerekli."};
+
+      if(v >= lln) return {g:0, c:"≥ LLN (Grade yok)"};
+      if(v < 25000)  return {g:4, c:"<25,000/mm³"};
+      if(v < 50000)  return {g:3, c:"<50,000–25,000/mm³"};
+      if(v < 75000)  return {g:2, c:"<75,000–50,000/mm³"};
+      return {g:1, c:"<LLN–75,000/mm³"};
+    }
+  },
+  {
+    id: "wbc",
+    name: "White blood cell decreased",
+    units: [{id:"per_mm3", label:"/mm³"}, {id:"x10e9_L", label:"x10^9/L"}],
+    needs: { uln:false, baseline:false, lln:true, sympt:false, flags:false },
+    hint: "LLN gerekir. Aralıklar WBC mutlak değer üzerinden.",
+    grade: (vRaw, ctx, unit) => {
+      const v = toPerMm3(vRaw, unit);
+      const lln = toPerMm3(ctx.lln, unit);
+      if(!Number.isFinite(v) || !Number.isFinite(lln)) return {g:null, c:"Hesap için değer ve LLN gerekli."};
+
+      if(v >= lln) return {g:0, c:"≥ LLN (Grade yok)"};
+      if(v < 1000)  return {g:4, c:"<1000/mm³"};
+      if(v < 2000)  return {g:3, c:"<2000–1000/mm³"};
+      if(v < 3000)  return {g:2, c:"<3000–2000/mm³"};
+      return {g:1, c:"<LLN–3000/mm³"};
+    }
+  },
+
+  // Elektrolitler
+  {
+    id: "hypona",
+    name: "Hyponatremia",
+    units: [{id:"mmol_L", label:"mmol/L"}],
+    needs: { uln:false, baseline:false, lln:true, sympt:true, flags:true },
+    hint: "125–129 için semptom bilgisi önemli (v5.0).",
+    grade: (v, ctx) => {
+      const sodium = v;
+      const lln = ctx.lln;
+      if(!Number.isFinite(sodium) || !Number.isFinite(lln)) return {g:null, c:"Hesap için değer ve LLN gerekli."};
+
+      const symptomatic = (ctx.sympt === "yes");
+      if(sodium >= lln) return {g:0, c:"≥ LLN (Grade yok)"};
+      if(sodium < 120)  return {g:4, c:"<120 mmol/L (CTCAE’de ‘life-threatening consequences’ notu var)"};
+      if(sodium < 125)  return {g:3, c:"120–124 mmol/L (semptomdan bağımsız)"};
+      if(sodium < 130)  return symptomatic ? {g:3, c:"125–129 mmol/L semptomatik"} : {g:2, c:"125–129 mmol/L aseptomatik"};
+      return {g:1, c:"<LLN–130 mmol/L"};
+    }
+  },
+  {
+    id: "hyperk",
+    name: "Hyperkalemia",
+    units: [{id:"mmol_L", label:"mmol/L"}],
+    needs: { uln:true, baseline:false, lln:false, sympt:false, flags:true },
+    hint: "Grade 2/3/4 satırlarında girişim/yatış/life-threatening ifadeleri var; burada bandı sayısal veriyoruz.",
+    grade: (v, ctx) => {
+      const k = v;
+      const uln = ctx.uln;
+      if(!Number.isFinite(k) || !Number.isFinite(uln)) return {g:null, c:"Hesap için değer ve ULN gerekli."};
+
+      if(k <= uln) return {g:0, c:"≤ ULN (Grade yok)"};
+      if(k > 7.0)  return {g:4, c:">7.0 mmol/L (CTCAE’de ‘life-threatening consequences’ notu var)"};
+      if(k > 6.0)  return {g:3, c:">6.0–7.0 mmol/L (CTCAE’de ‘hospitalization indicated’ notu var)"};
+      if(k > 5.5)  return {g:2, c:">5.5–6.0 mmol/L (CTCAE’de ‘intervention initiated’ notu var)"};
+      return {g:1, c:">ULN–5.5 mmol/L"};
+    }
+  },
+];
+
+const termSel = document.getElementById("term");
+const unitSel = document.getElementById("unit");
+const termHint = document.getElementById("termHint");
+
+const valueEl = document.getElementById("value");
+const ulnEl = document.getElementById("uln");
+const llnEl = document.getElementById("lln");
+const baseEl = document.getElementById("baseline");
+const symptEl = document.getElementById("sympt");
+const flagsEl = document.getElementById("sevFlags");
+
+const ulnWrap = document.getElementById("ulnWrap");
+const llnWrap = document.getElementById("llnWrap");
+const baseWrap = document.getElementById("baselineWrap");
+const symptWrap = document.getElementById("symptWrap");
+const intervWrap = document.getElementById("intervWrap");
+
+const outEl = document.getElementById("out");
+const critEl = document.getElementById("criterion");
+const errEl = document.getElementById("err");
+
+function renderTermOptions(){
+  termSel.innerHTML = TERMS.map(t => `<option value="${t.id}">${t.name}</option>`).join("");
+}
+function getTerm(){ return TERMS.find(t => t.id === termSel.value); }
+
+function renderUnits(){
+  const t = getTerm();
+  unitSel.innerHTML = t.units.map(u => `<option value="${u.id}">${u.label}</option>`).join("");
+  termHint.textContent = t.hint || "";
+}
+
+function toggleFields(){
+  const t = getTerm();
+  ulnWrap.style.display = t.needs.uln ? "block" : "none";
+  llnWrap.style.display = t.needs.lln ? "block" : "none";
+  baseWrap.style.display = t.needs.baseline ? "block" : "none";
+  symptWrap.style.display = t.needs.sympt ? "block" : "none";
+  intervWrap.style.display = t.needs.flags ? "block" : "none";
+}
+
+function compute(){
+  errEl.textContent = "";
+  const t = getTerm();
+  const unit = unitSel.value;
+
+  const v = num(valueEl.value);
+  const ctx = {
+    uln: num(ulnEl.value),
+    lln: num(llnEl.value),
+    baseline: num(baseEl.value),
+    sympt: symptEl.value,
+    flags: flagsEl.value
+  };
+
+  if(!Number.isFinite(v)){
+    errEl.textContent = "Değer sayısal olmalı.";
+    outEl.textContent = "Grade: —";
+    critEl.textContent = "";
+    return;
+  }
+
+  let res;
+  try{
+    // Bazı fonksiyonlar unit ister
+    res = (t.id === "anemia" || t.id === "anc" || t.id === "plt" || t.id === "wbc")
+      ? t.grade(v, ctx, unit)
+      : t.grade(v, ctx);
+
+    if(res.g === null){
+      errEl.textContent = res.c || "Eksik bilgi var.";
+      outEl.textContent = "Grade: —";
+      critEl.textContent = "";
+      return;
+    }
+    outEl.textContent = `Grade: ${res.g}`;
+    critEl.innerHTML = `${res.c} <span class="pill">${t.name}</span>`;
+  }catch(e){
+    errEl.textContent = "Hesaplama hatası: " + (e?.message || String(e));
+    outEl.textContent = "Grade: —";
+    critEl.textContent = "";
+  }
+}
+
+renderTermOptions();
+renderUnits();
+toggleFields();
+compute();
+
+termSel.addEventListener("change", () => { renderUnits(); toggleFields(); compute(); });
+unitSel.addEventListener("change", compute);
+[valueEl, ulnEl, llnEl, baseEl].forEach(el => el.addEventListener("input", compute));
+symptEl.addEventListener("change", compute);
+flagsEl.addEventListener("change", compute);
+</script>
+</body>
+</html>
